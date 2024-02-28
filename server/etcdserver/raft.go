@@ -99,6 +99,12 @@ type raftNode struct {
 
 	stopped chan struct{}
 	done    chan struct{}
+
+	// 새롭게 추가된 필드들
+	leaderConnectionQuality map[uint64]float64
+	leaderElectionThreshold float64
+	currentLeader           uint64
+	isLeaderStable          int32
 }
 
 type raftNodeConfig struct {
@@ -142,6 +148,12 @@ func newRaftNode(cfg raftNodeConfig) *raftNode {
 		applyc:     make(chan toApply),
 		stopped:    make(chan struct{}),
 		done:       make(chan struct{}),
+		
+		// 새롭게 추가된 필드들의 초기화
+		leaderConnectionQuality: make(map[uint64]float64),
+		leaderElectionThreshold: 0.8,
+		currentLeader:           0,
+		isLeaderStable:          0,
 	}
 	if r.heartbeat == 0 {
 		r.ticker = &time.Ticker{}
@@ -158,6 +170,37 @@ func (r *raftNode) tick() {
 	r.tickMu.Unlock()
 }
 
+// 연결 품질에 따른 리더 선출 및 상태 갱신 로직
+func (r *raftNode) electLeaderBasedOnConnectionQuality() {
+	var bestNode uint64
+	var highestQuality float64
+
+	// 가장 연결 품질이 좋은 노드 찾기
+	for nodeID, quality := range r.leaderConnectionQuality {
+		if quality > highestQuality {
+			bestNode = nodeID
+			highestQuality = quality
+		}
+	}
+
+	// 임계값을 넘는 노드가 있으면 그 노드를 리더로 설정
+	if highestQuality >= r.leaderElectionThreshold {
+		atomic.StoreUint64(&r.currentLeader, bestNode)
+		atomic.StoreInt32(&r.isLeaderStable, 1)
+	} else {
+		// 연결이 안정적인 노드가 없으면 기존 Raft 선거 프로세스를 통해 리더 선출
+		atomic.StoreInt32(&r.isLeaderStable, 0)
+		// Raft 선거 시작 로직 필요
+		
+		// 명시적으로 Raft 선거 프로세스 시작
+        r.Node.Campaign(context.TODO())
+		//r.Node.Campaign(context.TODO()) 호출은 Raft 라이브러리의 Node 인터페이스를 통해 현재 노드가 리더 선거에 참여하도록 합니다.
+		//이 메서드는 노드가 리더 선거를 시작하려고 시도할 때 사용됩니다. 
+		//context.TODO()는 임시적인 placeholder로, 실제 애플리케이션에서는 적절한 context를 제공해야 할 수 있습니다.
+	}
+}
+
+
 // start prepares and starts raftNode in a new goroutine. It is no longer safe
 // to modify the fields after it has been started.
 func (r *raftNode) start(rh *raftReadyHandler) {
@@ -165,6 +208,11 @@ func (r *raftNode) start(rh *raftReadyHandler) {
 
 	go func() {
 		defer r.onStop()
+		
+		// 연결 품질 기반 리더 선출을 위한 티커 추가
+		 leaderElectionTicker := time.NewTicker(time.Second * 5) // 5초마다 실행
+        	 defer leaderElectionTicker.Stop()
+		
 		islead := false
 
 		for {
@@ -324,7 +372,18 @@ func (r *raftNode) start(rh *raftReadyHandler) {
 				}
 			case <-r.stopped:
 				return
-			}
+
+			case <-leaderElectionTicker.C:
+                		// 연결 품질을 평가하여 리더 선출
+               	 		if atomic.LoadInt32(&r.isLeaderStable) == 0 {
+                    		r.electLeaderBasedOnConnectionQuality()
+                    		if atomic.LoadInt32(&r.isLeaderStable) == 1 {
+                       			 // 새로운 리더가 선출되었을 때 필요한 처리 구현, 예
+                        	         rh.updateLead(atomic.LoadUint64(&r.currentLeader))
+                   		 }
+               		  }
+			//기타 케이스...
+		       }
 		}
 	}()
 }
